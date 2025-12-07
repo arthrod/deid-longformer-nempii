@@ -65,7 +65,11 @@ Thumbs.db
 kaggle.json
 *.pem
 *.key
+PROJECT_ASSETS.md
+PROJECT_DOCUMENTATION.md
+*.json
 
 # Temporary files
 *.tmp
 *.temp
+CONTINUATION_PROMPT.md
