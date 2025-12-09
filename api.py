@@ -1,21 +1,28 @@
-﻿# api.py - Clinical De-identification FastAPI Service
+# api.py - Clinical De-identification FastAPI Service
 # Port 8001 on EC2 alongside CPT service (port 8000)
+# v1.2.0 - Added automatic chunking + medical terminology whitelist
 
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 import time
 import os
+import re
 
 from labels import ID2LABEL, ENTITY_TYPES
 from deid import ClinicalDeidentifier
+from medical_whitelist import MEDICAL_WHITELIST_LOWER
 
 # === Configuration ===
 MODEL_PATH = os.environ.get("DEID_MODEL_PATH", "checkpoints/best_model")
 MAX_TOKENS = 4096
+CHUNK_SIZE = 3500  # Leave room for special tokens
+CHUNK_OVERLAP = 256  # Token overlap between chunks
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # === Load Model (once at startup) ===
@@ -30,7 +37,7 @@ print(f"Model loaded: {model.num_parameters():,} parameters")
 app = FastAPI(
     title="Clinical De-identification API",
     description="PHI de-identification for clinical notes using Clinical-Longformer",
-    version="1.0.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -52,6 +59,7 @@ class DeidResponse(BaseModel):
     entities: Optional[list] = None
     token_count: int
     processing_time_ms: float
+    chunks_processed: int = 1
 
 class ValidateRequest(BaseModel):
     text: str
@@ -60,6 +68,8 @@ class ValidateResponse(BaseModel):
     valid: bool
     token_count: int
     exceeds_limit: bool
+    requires_chunking: bool
+    estimated_chunks: int
     message: str
 
 class BatchRequest(BaseModel):
@@ -76,10 +86,171 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     max_tokens: int
+    chunk_size: int
+    chunk_overlap: int
+
+
+# === Chunking Logic ===
+def find_sentence_boundary(text: str, target_pos: int, search_range: int = 200) -> int:
+    """Find the nearest sentence boundary to target_pos within search_range."""
+    # Look for sentence endings near target position
+    search_start = max(0, target_pos - search_range)
+    search_end = min(len(text), target_pos + search_range)
+    search_text = text[search_start:search_end]
+    
+    # Find all sentence boundaries in search range
+    # Match period/question/exclamation followed by space and capital letter, or newlines
+    boundaries = []
+    for match in re.finditer(r'[.!?]\s+(?=[A-Z])|\n\s*\n', search_text):
+        abs_pos = search_start + match.end()
+        boundaries.append(abs_pos)
+    
+    if not boundaries:
+        # No sentence boundary found, try just newlines
+        for match in re.finditer(r'\n', search_text):
+            abs_pos = search_start + match.end()
+            boundaries.append(abs_pos)
+    
+    if not boundaries:
+        return target_pos  # Fall back to target position
+    
+    # Return boundary closest to target
+    return min(boundaries, key=lambda x: abs(x - target_pos))
+
+
+def chunk_text(text: str) -> list[dict]:
+    """
+    Split text into overlapping chunks that fit within model's token limit.
+    Returns list of dicts with 'text', 'start_char', 'end_char' keys.
+    """
+    # First check if chunking is even needed
+    tokens = tokenizer.encode(text, add_special_tokens=True)
+    if len(tokens) <= MAX_TOKENS:
+        return [{"text": text, "start_char": 0, "end_char": len(text)}]
+    
+    chunks = []
+    current_pos = 0
+    
+    while current_pos < len(text):
+        # Encode from current position to find chunk boundary
+        remaining_text = text[current_pos:]
+        
+        # Binary search for the right chunk size in characters
+        # Start with an estimate based on average chars per token
+        avg_chars_per_token = len(text) / len(tokens)
+        estimated_chars = int(CHUNK_SIZE * avg_chars_per_token)
+        
+        # Adjust to find actual token boundary
+        low, high = estimated_chars // 2, min(estimated_chars * 2, len(remaining_text))
+        
+        while low < high:
+            mid = (low + high + 1) // 2
+            test_text = remaining_text[:mid]
+            test_tokens = tokenizer.encode(test_text, add_special_tokens=True)
+            
+            if len(test_tokens) <= CHUNK_SIZE:
+                low = mid
+            else:
+                high = mid - 1
+        
+        chunk_char_end = low
+        
+        # If this isn't the last chunk, try to break at a sentence boundary
+        if current_pos + chunk_char_end < len(text):
+            # Calculate overlap in characters
+            overlap_chars = int(CHUNK_OVERLAP * avg_chars_per_token)
+            boundary = find_sentence_boundary(
+                remaining_text, 
+                chunk_char_end - overlap_chars,
+                search_range=overlap_chars
+            )
+            if boundary > overlap_chars:  # Ensure we're making progress
+                chunk_char_end = boundary
+        
+        chunk_text_content = remaining_text[:chunk_char_end]
+        chunks.append({
+            "text": chunk_text_content,
+            "start_char": current_pos,
+            "end_char": current_pos + chunk_char_end
+        })
+        
+        # Move position, accounting for overlap
+        if current_pos + chunk_char_end >= len(text):
+            break
+        
+        # Calculate overlap
+        overlap_chars = int(CHUNK_OVERLAP * avg_chars_per_token)
+        next_pos = current_pos + chunk_char_end - overlap_chars
+        
+        # Ensure we're making progress
+        if next_pos <= current_pos:
+            next_pos = current_pos + chunk_char_end
+        
+        current_pos = next_pos
+    
+    return chunks
+
+
+def merge_entities(all_entities: list[list[dict]], chunks: list[dict]) -> list[dict]:
+    """
+    Merge entities from multiple chunks, deduplicating overlapping detections.
+    Entities are considered duplicates if they overlap significantly.
+    """
+    # Adjust entity positions to absolute positions in original text
+    adjusted_entities = []
+    
+    for chunk_idx, (entities, chunk) in enumerate(zip(all_entities, chunks)):
+        for entity in entities:
+            adjusted = entity.copy()
+            adjusted["start"] = chunk["start_char"] + entity["start"]
+            adjusted["end"] = chunk["start_char"] + entity["end"]
+            adjusted["_chunk"] = chunk_idx  # Track source chunk for debugging
+            adjusted_entities.append(adjusted)
+    
+    if not adjusted_entities:
+        return []
+    
+    # Sort by start position
+    adjusted_entities.sort(key=lambda x: (x["start"], -x["end"]))
+    
+    # Deduplicate overlapping entities
+    merged = []
+    for entity in adjusted_entities:
+        # Check if this entity overlaps with any already merged entity
+        is_duplicate = False
+        for existing in merged:
+            # Calculate overlap
+            overlap_start = max(entity["start"], existing["start"])
+            overlap_end = min(entity["end"], existing["end"])
+            
+            if overlap_start < overlap_end:  # There is overlap
+                overlap_len = overlap_end - overlap_start
+                entity_len = entity["end"] - entity["start"]
+                existing_len = existing["end"] - existing["start"]
+                
+                # If overlap is >50% of either entity, consider duplicate
+                if overlap_len > 0.5 * entity_len or overlap_len > 0.5 * existing_len:
+                    is_duplicate = True
+                    # Keep the longer entity
+                    if entity_len > existing_len:
+                        merged.remove(existing)
+                        merged.append(entity)
+                    break
+        
+        if not is_duplicate:
+            merged.append(entity)
+    
+    # Remove internal tracking field and sort by position
+    for entity in merged:
+        entity.pop("_chunk", None)
+    
+    merged.sort(key=lambda x: x["start"])
+    return merged
+
 
 # === Core Inference Logic ===
-def extract_entities(text: str) -> list[dict]:
-    """Run model inference and extract entity spans."""
+def extract_entities_single(text: str) -> list[dict]:
+    """Run model inference on a single chunk and extract entity spans."""
     
     # Tokenize
     encoding = tokenizer(
@@ -161,7 +332,151 @@ def extract_entities(text: str) -> list[dict]:
     if current_entity:
         entities.append(current_entity)
     
+    # Post-process: merge adjacent entities of the same type
+    # This fixes cases where model predicts B-DATE, B-DATE, B-DATE instead of B-DATE, I-DATE, L-DATE
+    entities = merge_adjacent_entities(entities, text)
+    
     return entities
+
+
+def merge_adjacent_entities(entities: list[dict], text: str, max_gap: int = 2) -> list[dict]:
+    """
+    Merge adjacent entities of the same type that are separated by at most max_gap characters.
+    This fixes BILOU prediction errors where multi-token entities get split.
+    
+    Args:
+        entities: List of entity dicts with 'type', 'start', 'end', 'text'
+        text: Original text (to extract merged text spans)
+        max_gap: Maximum character gap between entities to consider them mergeable
+    
+    Returns:
+        Merged entity list
+    """
+    if not entities:
+        return entities
+    
+    # Sort by start position
+    sorted_ents = sorted(entities, key=lambda x: x["start"])
+    
+    merged = []
+    current = sorted_ents[0].copy()
+    
+    for next_ent in sorted_ents[1:]:
+        gap = next_ent["start"] - current["end"]
+        same_type = next_ent["type"] == current["type"]
+        
+        # Merge if same type and adjacent (gap <= max_gap chars, typically punctuation/spaces)
+        if same_type and 0 <= gap <= max_gap:
+            # Check that gap only contains expected characters (punctuation, spaces, slashes, dashes)
+            gap_text = text[current["end"]:next_ent["start"]]
+            if all(c in " /-.:," for c in gap_text):
+                # Extend current entity
+                current["end"] = next_ent["end"]
+                current["text"] = text[current["start"]:current["end"]]
+                continue
+        
+        # Can't merge - save current and start new
+        merged.append(current)
+        current = next_ent.copy()
+    
+    merged.append(current)
+    return merged
+
+
+def extract_entities(text: str) -> tuple[list[dict], int]:
+    """
+    Extract entities from text, automatically chunking if needed.
+    Returns (entities, num_chunks).
+    """
+    chunks = chunk_text(text)
+    
+    if len(chunks) == 1:
+        # No chunking needed
+        return extract_entities_single(text), 1
+    
+    # Process each chunk
+    all_chunk_entities = []
+    for chunk in chunks:
+        chunk_entities = extract_entities_single(chunk["text"])
+        all_chunk_entities.append(chunk_entities)
+    
+    # Merge entities from all chunks
+    merged_entities = merge_entities(all_chunk_entities, chunks)
+    
+    # Update entity text from original document (in case of boundary issues)
+    for entity in merged_entities:
+        entity["text"] = text[entity["start"]:entity["end"]]
+    
+    return merged_entities, len(chunks)
+
+
+def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
+    """
+    Remove entities that match medical terminology whitelist.
+    This prevents false positives like "Anion Gap" being replaced with fake names.
+    Handles both single entities and adjacent name entities that form medical terms.
+    Also filters out common time words misclassified as DATE entities.
+    """
+    if not entities:
+        return entities
+    
+    # Common time words that get misclassified as DATE
+    DATE_FALSE_POSITIVES = {
+        "week", "weeks", "day", "days", "month", "months", "year", "years",
+        "hour", "hours", "minute", "minutes", "second", "seconds",
+        "morning", "afternoon", "evening", "night", "tonight", "today",
+        "tomorrow", "yesterday", "daily", "weekly", "monthly", "yearly",
+        "am", "pm", "noon", "midnight"
+    }
+    
+    # Sort entities by position for adjacency checking
+    sorted_entities = sorted(entities, key=lambda x: x["start"])
+    
+    # First pass: mark entities that are part of whitelisted multi-word terms
+    skip_indices = set()
+    
+    for i in range(len(sorted_entities) - 1):
+        curr = sorted_entities[i]
+        next_ent = sorted_entities[i + 1]
+        
+        # Check if two adjacent name entities form a whitelisted term
+        if (curr["type"] in ("FIRST_NAME", "LAST_NAME", "NAME") and 
+            next_ent["type"] in ("FIRST_NAME", "LAST_NAME", "NAME")):
+            
+            # Check if they're actually adjacent (within a few chars, allowing for space)
+            gap = next_ent["start"] - curr["end"]
+            if 0 <= gap <= 3:  # Allow for space or small gap
+                combined = f"{curr['text']} {next_ent['text']}".strip().lower()
+                # Also try without space for hyphenated terms
+                combined_no_space = f"{curr['text']}{next_ent['text']}".lower()
+                
+                if combined in MEDICAL_WHITELIST_LOWER or combined_no_space in MEDICAL_WHITELIST_LOWER:
+                    skip_indices.add(i)
+                    skip_indices.add(i + 1)
+    
+    # Second pass: filter entities
+    filtered = []
+    for i, entity in enumerate(sorted_entities):
+        # Skip if marked for removal due to multi-word match
+        if i in skip_indices:
+            continue
+            
+        # Check single-entity matches for names
+        if entity["type"] in ("FIRST_NAME", "LAST_NAME", "NAME"):
+            text_lower = entity["text"].strip().lower()
+            if text_lower in MEDICAL_WHITELIST_LOWER:
+                continue  # Skip whitelisted term
+        
+        # Check for date false positives (common time words)
+        if entity["type"] in ("DATE", "DATE_OF_BIRTH", "DATE_TIME"):
+            text_lower = entity["text"].strip().lower()
+            if text_lower in DATE_FALSE_POSITIVES:
+                continue  # Skip common time words
+        
+        filtered.append(entity)
+    
+    return filtered
+
 
 def deidentify_text(text: str, entities: list[dict], seed: Optional[int] = None) -> str:
     """Replace detected entities with fake data."""
@@ -179,6 +494,7 @@ def deidentify_text(text: str, entities: list[dict], seed: Optional[int] = None)
     
     return result
 
+
 # === API Endpoints ===
 @app.get("/deid/health", response_model=HealthResponse)
 async def health_check():
@@ -188,7 +504,10 @@ async def health_check():
         model_loaded=True,
         device=DEVICE,
         max_tokens=MAX_TOKENS,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
+
 
 @app.post("/deid/validate", response_model=ValidateResponse)
 async def validate_text(request: ValidateRequest):
@@ -196,29 +515,42 @@ async def validate_text(request: ValidateRequest):
     tokens = tokenizer.encode(request.text, add_special_tokens=True)
     token_count = len(tokens)
     exceeds = token_count > MAX_TOKENS
+    requires_chunking = exceeds
+    
+    # Estimate number of chunks needed
+    if requires_chunking:
+        effective_chunk_size = CHUNK_SIZE - CHUNK_OVERLAP
+        estimated_chunks = (token_count + effective_chunk_size - 1) // effective_chunk_size
+    else:
+        estimated_chunks = 1
+    
+    message = f"Text has {token_count} tokens"
+    if requires_chunking:
+        message += f" (will be processed in ~{estimated_chunks} chunks)"
     
     return ValidateResponse(
-        valid=not exceeds,
+        valid=True,  # Always valid now with chunking support
         token_count=token_count,
         exceeds_limit=exceeds,
-        message=f"Text has {token_count} tokens" + (f" (exceeds {MAX_TOKENS} limit)" if exceeds else ""),
+        requires_chunking=requires_chunking,
+        estimated_chunks=estimated_chunks,
+        message=message,
     )
+
 
 @app.post("/deid/process", response_model=DeidResponse)
 async def process_text(request: DeidRequest):
-    """De-identify a single clinical note."""
+    """De-identify a single clinical note (automatically chunks if needed)."""
     start_time = time.time()
     
-    # Validate length
+    # Count tokens for response
     tokens = tokenizer.encode(request.text, add_special_tokens=True)
-    if len(tokens) > MAX_TOKENS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Text exceeds {MAX_TOKENS} token limit ({len(tokens)} tokens). Use chunking for longer documents."
-        )
     
-    # Extract entities
-    entities = extract_entities(request.text)
+    # Extract entities (handles chunking automatically)
+    entities, num_chunks = extract_entities(request.text)
+    
+    # Filter out whitelisted medical terms (prevents false positives)
+    entities = filter_whitelisted_entities(entities)
     
     # De-identify
     deidentified = deidentify_text(request.text, entities, request.seed)
@@ -230,7 +562,9 @@ async def process_text(request: DeidRequest):
         entities=entities if request.return_entities else None,
         token_count=len(tokens),
         processing_time_ms=round(processing_time, 2),
+        chunks_processed=num_chunks,
     )
+
 
 @app.post("/deid/batch", response_model=BatchResponse)
 async def process_batch(request: BatchRequest):
@@ -245,13 +579,9 @@ async def process_batch(request: BatchRequest):
         note_start = time.time()
         tokens = tokenizer.encode(note, add_special_tokens=True)
         
-        if len(tokens) > MAX_TOKENS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Note {i} exceeds {MAX_TOKENS} token limit"
-            )
-        
-        entities = extract_entities(note)
+        entities, num_chunks = extract_entities(note)
+        # Filter out whitelisted medical terms
+        entities = filter_whitelisted_entities(entities)
         # Use seed + index for reproducibility across batch
         seed = request.seed + i if request.seed else None
         deidentified = deidentify_text(note, entities, seed)
@@ -261,12 +591,24 @@ async def process_batch(request: BatchRequest):
             entities=entities if request.return_entities else None,
             token_count=len(tokens),
             processing_time_ms=round((time.time() - note_start) * 1000, 2),
+            chunks_processed=num_chunks,
         ))
     
     return BatchResponse(
         results=results,
         total_processing_time_ms=round((time.time() - start_time) * 1000, 2),
     )
+
+
+# Mount static files for UI
+static_path = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_path):
+    app.mount("/static", StaticFiles(directory=static_path), name="static")
+    
+    @app.get("/")
+    async def root():
+        return FileResponse(os.path.join(static_path, "index.html"))
+
 
 if __name__ == "__main__":
     import uvicorn
