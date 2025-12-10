@@ -1,5 +1,5 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.2.1 - Context-aware DOB detection
+# v2.3.0 - Adjacent name entity combination for consistent replacements
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
@@ -10,7 +10,8 @@
 # - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
 # - DOB line cleanup (prevents concatenated date artifacts)
 # - Age-preserving DOB (±2 year jitter keeps patient age realistic)
-# - Context-aware DOB detection (DATE after "DOB:" treated as DATE_OF_BIRTH)
+# - Context-aware DOB detection (DATE after "DOB:" gets age-preserving replacement)
+# - Adjacent name combination (FIRST_NAME + LAST_NAME → NAME for consistent cache lookup)
 
 from faker import Faker
 from datetime import datetime, timedelta
@@ -59,6 +60,69 @@ def _clean_dob_lines(text: str) -> str:
     return DOB_LINE_RE.sub(repl, text)
 
 
+def _combine_adjacent_name_entities(entities: list, text: str) -> list:
+    """
+    Combine adjacent FIRST_NAME/LAST_NAME entities into single NAME entities.
+    This ensures that split names like "Sarah" + "Johnson" get the same cache key
+    as full names like "Dr. Sarah Elizabeth Johnson, MD".
+    """
+    name_types = {"FIRST_NAME", "LAST_NAME", "NAME"}
+    
+    # Sort by position
+    sorted_ents = sorted(entities, key=lambda x: x["start"])
+    
+    combined = []
+    i = 0
+    while i < len(sorted_ents):
+        curr = sorted_ents[i]
+        
+        if curr["type"] not in name_types:
+            combined.append(curr.copy())
+            i += 1
+            continue
+        
+        # Try to combine with following name entities
+        group_start = curr["start"]
+        group_end = curr["end"]
+        j = i + 1
+        
+        while j < len(sorted_ents):
+            next_ent = sorted_ents[j]
+            if next_ent["type"] not in name_types:
+                break
+            
+            gap = next_ent["start"] - group_end
+            # Allow gap of up to 15 chars for ", MD" or middle initials etc.
+            if gap > 15:
+                break
+            
+            # Check gap only contains expected chars
+            gap_text = text[group_end:next_ent["start"]]
+            # Allow spaces, punctuation, and single uppercase letters (initials)
+            if gap_text and not re.match(r'^[\s.,\-\']+[A-Z]?\.?[\s.,\-\']*$|^[\s.,\-\']*$', gap_text):
+                break
+            
+            group_end = next_ent["end"]
+            j += 1
+        
+        if j > i + 1:
+            # Combined multiple entities into one NAME
+            combined_text = text[group_start:group_end]
+            combined.append({
+                "type": "NAME",
+                "start": group_start,
+                "end": group_end,
+                "text": combined_text
+            })
+            i = j
+        else:
+            # Single name entity - keep as-is but will be handled by normalize_name
+            combined.append(curr.copy())
+            i += 1
+    
+    return combined
+
+
 class ClinicalDeidentifier:
     def __init__(self, seed: Optional[int] = None):
         self.fake = Faker('en_US')
@@ -70,12 +134,15 @@ class ClinicalDeidentifier:
         self._cache = {}
         self._date_shift = None
         self._current_location = None  # For geographic consistency
+        # Track generated full names for first/last consistency
+        self._full_name_cache = {}
         
     def reset_cache(self):
         """Call between documents to reset consistency caches."""
         self._cache = {}
         self._date_shift = random.randint(-365, -30)  # Shift 1-12 months back
         self._current_location = None
+        self._full_name_cache = {}
     
     def _get_cached(self, original: str, entity_type: str, generator_fn):
         """Ensure consistent replacement within a document."""
@@ -526,6 +593,10 @@ def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     """
     deid = ClinicalDeidentifier(seed=seed)
     deid.reset_cache()
+    
+    # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
+    # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
+    entities = _combine_adjacent_name_entities(entities, text)
     
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
