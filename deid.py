@@ -1,11 +1,12 @@
 # deid.py - Clinical De-identification Surrogate Generator
-# v2.3.1 - Fix DATE entity fragmentation on longer documents
+# v2.4.0 - Fix short date parsing (MM/DD) and consistent date fallback
 #
 # Key features:
 # - Consistent replacement within documents (same PHI → same fake)
 # - Format preservation (phone, SSN, dates match original format)
 # - Realistic surrogates (not bracketed placeholders)
 # - Date shifting preserves temporal relationships
+# - Short date support (12/13 → parsed as current year, shifted consistently)
 # - Geographic consistency (city/state/zip match)
 # - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
 # - DOB line cleanup (prevents concatenated date artifacts)
@@ -361,8 +362,12 @@ class ClinicalDeidentifier:
             shifted = dt + timedelta(days=self._date_shift)
             return shifted.strftime(fmt)
         
-        # Couldn't parse - return shifted placeholder that looks like a date
-        return self.fake.date(pattern="%m/%d/%Y")
+        # Couldn't parse - apply consistent shift to a reference date
+        # This maintains temporal consistency even for unparseable dates
+        # Use a reference date and apply the same shift
+        reference_date = datetime(2025, 1, 15)  # Fixed reference
+        shifted = reference_date + timedelta(days=self._date_shift)
+        return shifted.strftime("%m/%d/%Y")
     
     def _generate_dob(self, text: str) -> str:
         """Generate realistic DOB preserving approximate age (±2 years)."""
@@ -447,7 +452,7 @@ class ClinicalDeidentifier:
             except ValueError:
                 continue
         
-        # Try regex for partial dates like "12/07/25"
+        # Try regex for partial dates like "12/07/25" (with year)
         match = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', text)
         if match:
             m, d, y = match.groups()
@@ -461,6 +466,21 @@ class ClinicalDeidentifier:
                     fmt = f"%m{sep}%d{sep}%y"
                 else:
                     fmt = f"%m{sep}%d{sep}%Y"
+                return (dt, fmt)
+            except ValueError:
+                pass
+        
+        # Try regex for SHORT dates like "12/13" or "12/15" (MM/DD without year)
+        # Assume current year for these clinical encounter dates
+        short_match = re.match(r'^(\d{1,2})[/\-](\d{1,2})$', text.strip())
+        if short_match:
+            m, d = short_match.groups()
+            try:
+                current_year = datetime.now().year
+                dt = datetime(current_year, int(m), int(d))
+                sep = "/" if "/" in text else "-"
+                # Use short format (no year) to preserve original appearance
+                fmt = f"%m{sep}%d"
                 return (dt, fmt)
             except ValueError:
                 pass
