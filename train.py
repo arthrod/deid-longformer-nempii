@@ -18,7 +18,7 @@ import argparse
 
 from labels import LABELS, LABEL2ID, ID2LABEL, NUM_LABELS, ENTITY_TYPES
 
-MODEL_NAME = "yikuan8/Clinical-Longformer"
+DEFAULT_MODEL = "allenai/longformer-base-4096"
 
 class DeidDataset(Dataset):
     def __init__(self, records):
@@ -169,9 +169,10 @@ def train(args):
     class_weights = compute_class_weights(train_records).to(device)
     
     # Load model
-    print(f"\nLoading model: {MODEL_NAME}")
+    model_name = args.model_name
+    print(f"\nLoading model: {model_name}")
     model = LongformerForTokenClassification.from_pretrained(
-        MODEL_NAME,
+        model_name,
         num_labels=NUM_LABELS,
         id2label=ID2LABEL,
         label2id=LABEL2ID
@@ -261,7 +262,7 @@ def train(args):
             model.save_pretrained(output_dir / "best_model")
             
             # Save tokenizer too for easy loading
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
             tokenizer.save_pretrained(output_dir / "best_model")
         
         print()
@@ -278,6 +279,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--model_name", default=DEFAULT_MODEL,
+                        help=f"Base model name (default: {DEFAULT_MODEL})")
     args = parser.parse_args()
     
     train(args)

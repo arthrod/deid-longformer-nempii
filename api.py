@@ -1,6 +1,4 @@
-# api.py - Clinical De-identification FastAPI Service
-# Port 8001 on EC2 alongside CPT service (port 8000)
-# v1.2.1 - Use deidentify_text from deid.py (includes DOB cleanup)
+# api.py - PII De-identification FastAPI Service (Brazilian Portuguese)
 
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
@@ -15,8 +13,8 @@ import os
 import re
 
 from labels import ID2LABEL, ENTITY_TYPES
-from deid import ClinicalDeidentifier, deidentify_text
-from medical_whitelist import MEDICAL_WHITELIST_LOWER
+from deid import PIIDeidentifier, deidentify_text
+from whitelist import PII_WHITELIST_LOWER
 
 # === Configuration ===
 MODEL_PATH = os.environ.get("DEID_MODEL_PATH", "checkpoints/best_model")
@@ -35,9 +33,9 @@ print(f"Model loaded: {model.num_parameters():,} parameters")
 
 # === FastAPI App ===
 app = FastAPI(
-    title="Clinical De-identification API",
-    description="PHI de-identification for clinical notes using Clinical-Longformer",
-    version="1.2.0",
+    title="PII De-identification API",
+    description="PII removal for Portuguese text using Longformer",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -50,7 +48,7 @@ app.add_middleware(
 
 # === Request/Response Models ===
 class DeidRequest(BaseModel):
-    text: str = Field(..., description="Clinical note text to de-identify")
+    text: str = Field(..., description="Text to de-identify (PII removal)")
     return_entities: bool = Field(False, description="Include detected entities in response")
     seed: Optional[int] = Field(None, description="Random seed for reproducible replacements")
 
@@ -412,21 +410,22 @@ def extract_entities(text: str) -> tuple[list[dict], int]:
 
 def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
     """
-    Remove entities that match medical terminology whitelist.
-    This prevents false positives like "Anion Gap" being replaced with fake names.
-    Handles both single entities and adjacent name entities that form medical terms.
+    Remove entities that match the PII whitelist.
+    This prevents false positives like institution abbreviations or common
+    Portuguese words being replaced with fake data.
     Also filters out common time words misclassified as DATE entities.
     """
     if not entities:
         return entities
-    
-    # Common time words that get misclassified as DATE
+
+    # Common time words (Portuguese and English) that get misclassified as DATE
     DATE_FALSE_POSITIVES = {
+        "semana", "semanas", "dia", "dias", "mes", "meses", "ano", "anos",
+        "hora", "horas", "minuto", "minutos", "segundo", "segundos",
+        "manha", "tarde", "noite", "hoje", "amanha", "ontem",
+        "diario", "semanal", "mensal", "anual",
         "week", "weeks", "day", "days", "month", "months", "year", "years",
-        "hour", "hours", "minute", "minutes", "second", "seconds",
-        "morning", "afternoon", "evening", "night", "tonight", "today",
-        "tomorrow", "yesterday", "daily", "weekly", "monthly", "yearly",
-        "am", "pm", "noon", "midnight"
+        "today", "tomorrow", "yesterday",
     }
     
     # Sort entities by position for adjacency checking
@@ -440,8 +439,8 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
         next_ent = sorted_entities[i + 1]
         
         # Check if two adjacent name entities form a whitelisted term
-        if (curr["type"] in ("FIRST_NAME", "LAST_NAME", "NAME") and 
-            next_ent["type"] in ("FIRST_NAME", "LAST_NAME", "NAME")):
+        if (curr["type"] in ("FIRST_NAME", "MIDDLE_NAME", "LAST_NAME", "NAME") and
+            next_ent["type"] in ("FIRST_NAME", "MIDDLE_NAME", "LAST_NAME", "NAME")):
             
             # Check if they're actually adjacent (within a few chars, allowing for space)
             gap = next_ent["start"] - curr["end"]
@@ -450,7 +449,7 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
                 # Also try without space for hyphenated terms
                 combined_no_space = f"{curr['text']}{next_ent['text']}".lower()
                 
-                if combined in MEDICAL_WHITELIST_LOWER or combined_no_space in MEDICAL_WHITELIST_LOWER:
+                if combined in PII_WHITELIST_LOWER or combined_no_space in PII_WHITELIST_LOWER:
                     skip_indices.add(i)
                     skip_indices.add(i + 1)
     
@@ -462,13 +461,13 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
             continue
             
         # Check single-entity matches for names
-        if entity["type"] in ("FIRST_NAME", "LAST_NAME", "NAME"):
+        if entity["type"] in ("FIRST_NAME", "MIDDLE_NAME", "LAST_NAME", "NAME"):
             text_lower = entity["text"].strip().lower()
-            if text_lower in MEDICAL_WHITELIST_LOWER:
+            if text_lower in PII_WHITELIST_LOWER:
                 continue  # Skip whitelisted term
         
         # Check for date false positives (common time words)
-        if entity["type"] in ("DATE", "DATE_OF_BIRTH", "DATE_TIME"):
+        if entity["type"] in ("DATE_OF_BIRTH",):
             text_lower = entity["text"].strip().lower()
             if text_lower in DATE_FALSE_POSITIVES:
                 continue  # Skip common time words
@@ -476,9 +475,6 @@ def filter_whitelisted_entities(entities: list[dict]) -> list[dict]:
         filtered.append(entity)
     
     return filtered
-
-
-# deidentify_text is now imported from deid.py (includes DOB cleanup)
 
 
 # === API Endpoints ===
@@ -526,7 +522,7 @@ async def validate_text(request: ValidateRequest):
 
 @app.post("/deid/process", response_model=DeidResponse)
 async def process_text(request: DeidRequest):
-    """De-identify a single clinical note (automatically chunks if needed)."""
+    """De-identify a single text (automatically chunks if needed)."""
     start_time = time.time()
     
     # Count tokens for response
@@ -535,9 +531,9 @@ async def process_text(request: DeidRequest):
     # Extract entities (handles chunking automatically)
     entities, num_chunks = extract_entities(request.text)
     
-    # Filter out whitelisted medical terms (prevents false positives)
+    # Filter out whitelisted terms (prevents false positives)
     entities = filter_whitelisted_entities(entities)
-    
+
     # De-identify
     deidentified = deidentify_text(request.text, entities, request.seed)
     
@@ -554,7 +550,7 @@ async def process_text(request: DeidRequest):
 
 @app.post("/deid/batch", response_model=BatchResponse)
 async def process_batch(request: BatchRequest):
-    """De-identify multiple clinical notes."""
+    """De-identify multiple texts."""
     start_time = time.time()
     
     if len(request.notes) > 100:
@@ -566,7 +562,7 @@ async def process_batch(request: BatchRequest):
         tokens = tokenizer.encode(note, add_special_tokens=True)
         
         entities, num_chunks = extract_entities(note)
-        # Filter out whitelisted medical terms
+        # Filter out whitelisted terms
         entities = filter_whitelisted_entities(entities)
         # Use seed + index for reproducibility across batch
         seed = request.seed + i if request.seed else None

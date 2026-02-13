@@ -1,19 +1,14 @@
-# deid.py - Clinical De-identification Surrogate Generator
-# v2.4.0 - Fix short date parsing (MM/DD) and consistent date fallback
+# deid.py - PII De-identification Surrogate Generator (Brazilian Portuguese)
 #
 # Key features:
-# - Consistent replacement within documents (same PHI → same fake)
-# - Format preservation (phone, SSN, dates match original format)
-# - Realistic surrogates (not bracketed placeholders)
+# - Consistent replacement within documents (same PII → same fake)
+# - Format preservation (phone, CPF, dates match original format)
+# - Realistic surrogates using Faker pt_BR locale
+# - Brazilian document generators (CPF, RG, PIS, CEP, credit card)
 # - Date shifting preserves temporal relationships
-# - Short date support (12/13 → parsed as current year, shifted consistently)
-# - Geographic consistency (city/state/zip match)
-# - Name normalization (Dr. Sarah Johnson, MD → same fake as Sarah Johnson)
-# - DOB line cleanup (prevents concatenated date artifacts)
-# - Age-preserving DOB (±2 year jitter keeps patient age realistic)
-# - Context-aware DOB detection (DATE after "DOB:" gets age-preserving replacement)
-# - Adjacent name combination (FIRST_NAME + LAST_NAME → NAME for consistent cache lookup)
-# - DATE entity merging (fixes model fragmenting dates into pieces)
+# - Name normalization for cache consistency
+# - Sensitive data redacted with marker text (no realistic surrogates)
+# - Adjacent name combination for consistent physician/person names
 
 from faker import Faker
 from datetime import datetime, timedelta
@@ -21,213 +16,123 @@ import random
 import re
 from typing import Optional, Tuple
 
+from labels import SENSITIVE_ENTITY_TYPES
+
+# Redaction marker for sensitive data types
+SENSITIVE_REDACTION_MARKER = "[DADO SENSIVEL REMOVIDO]"
+
 
 def normalize_name(name: str) -> str:
     """
-    Normalize a clinician/patient name so that variants like
-    'Dr. Sarah Elizabeth Johnson, MD' and 'Sarah E. Johnson, MD'
+    Normalize a person name so that variants like
+    'Dr. Maria Elizabeth Silva' and 'Maria E. Silva'
     map to the same cache key.
     """
     n = name.lower()
-    # Remove common titles/credentials
-    n = re.sub(r'\b(dr\.?|md|do|phd|rn|np|pa\-c|dpm|dds|od|pharmd|pt|ot|cna|lpn|lvn|aprn|crna|dnp|mph|ms|ma|bs|ba|jr\.?|sr\.?|ii|iii|iv)\b', '', n)
+    # Remove common Portuguese titles/credentials
+    n = re.sub(
+        r'\b(dr\.?|dra\.?|prof\.?|profa\.?|sr\.?|sra\.?|eng\.?|adv\.?'
+        r'|me\.?|ms\.?|phd|jr\.?|neto|filho|filha|sobrinho|sobrinha)\b',
+        '', n
+    )
     # Remove non-letter characters except spaces
-    n = re.sub(r'[^a-z\s]', ' ', n)
+    n = re.sub(r'[^a-záàãâéêíóôõúç\s]', ' ', n)
     # Collapse multiple spaces
     n = re.sub(r'\s+', ' ', n).strip()
     parts = n.split()
     if len(parts) >= 2:
-        # First + last name only; ignore middle/initials
         return f"{parts[0]} {parts[-1]}"
     return n.strip()
 
 
-# DOB line cleanup regex patterns
-DOB_LINE_RE = re.compile(r'^(DOB:\s*)(.+)$', re.MULTILINE | re.IGNORECASE)
-DATE_RE = re.compile(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}')
-
-
-def _clean_dob_lines(text: str) -> str:
-    """
-    Post-process DOB lines so that if multiple dates ended up on the same line
-    (e.g., from overlapping entity replacements), we keep only the first clean date.
-    """
-    def repl(match: re.Match) -> str:
-        prefix, rest = match.groups()
-        dates = DATE_RE.findall(rest)
-        if not dates:
-            return match.group(0)
-        # Use the first detected date; discard any extra concatenated dates
-        return f"{prefix}{dates[0]}"
-    return DOB_LINE_RE.sub(repl, text)
-
-
-def _merge_adjacent_date_entities(entities: list, text: str) -> list:
-    """
-    Merge adjacent DATE/DATE_TIME/DATE_OF_BIRTH entities that got fragmented by the model.
-    For example, "03/15/1965" might get split into "03", "/", "15", "/", "1965".
-    This merges them back into a single entity.
-    """
-    date_types = {"DATE", "DATE_TIME", "DATE_OF_BIRTH"}
-    
-    # Sort by position
-    sorted_ents = sorted(entities, key=lambda x: x["start"])
-    
-    merged = []
-    i = 0
-    while i < len(sorted_ents):
-        curr = sorted_ents[i]
-        
-        if curr["type"] not in date_types:
-            merged.append(curr.copy())
-            i += 1
-            continue
-        
-        # Try to combine with following date-like entities
-        group_start = curr["start"]
-        group_end = curr["end"]
-        j = i + 1
-        
-        while j < len(sorted_ents):
-            next_ent = sorted_ents[j]
-            # Accept any date-type entity or even short gaps
-            if next_ent["type"] not in date_types:
-                # Check if there's a small gap that looks like part of a date
-                gap = next_ent["start"] - group_end
-                if gap > 3:  # Too far apart
-                    break
-                # Skip non-date entities in the gap
-                j += 1
-                continue
-            
-            gap = next_ent["start"] - group_end
-            # Allow gap of up to 1 char for slashes/dashes that might not be entities
-            if gap > 1:
-                break
-            
-            # Check gap only contains date separators
-            gap_text = text[group_end:next_ent["start"]]
-            if gap_text and not all(c in "/-" for c in gap_text):
-                break
-            
-            group_end = next_ent["end"]
-            j += 1
-        
-        # Create merged entity
-        combined_text = text[group_start:group_end]
-        # Only merge if it looks like a date pattern
-        if j > i + 1 and DATE_RE.search(combined_text):
-            merged.append({
-                "type": "DATE",  # Will be re-classified by context detection
-                "start": group_start,
-                "end": group_end,
-                "text": combined_text
-            })
-            i = j
-        else:
-            merged.append(curr.copy())
-            i += 1
-    
-    return merged
-
-
 def _combine_adjacent_name_entities(entities: list, text: str) -> list:
     """
-    Combine adjacent FIRST_NAME/LAST_NAME entities into single NAME entities.
-    This ensures that split names like "Sarah" + "Johnson" get the same cache key
-    as full names like "Dr. Sarah Elizabeth Johnson, MD".
+    Combine adjacent FIRST_NAME/MIDDLE_NAME/LAST_NAME entities into single NAME entities.
+    This ensures that split names get the same cache key.
     """
-    name_types = {"FIRST_NAME", "LAST_NAME", "NAME"}
-    
-    # Sort by position
+    name_types = {"FIRST_NAME", "MIDDLE_NAME", "LAST_NAME", "NAME"}
+
     sorted_ents = sorted(entities, key=lambda x: x["start"])
-    
+
     combined = []
     i = 0
     while i < len(sorted_ents):
         curr = sorted_ents[i]
-        
+
         if curr["type"] not in name_types:
             combined.append(curr.copy())
             i += 1
             continue
-        
-        # Try to combine with following name entities
+
         group_start = curr["start"]
         group_end = curr["end"]
         j = i + 1
-        
+
         while j < len(sorted_ents):
             next_ent = sorted_ents[j]
             if next_ent["type"] not in name_types:
                 break
-            
+
             gap = next_ent["start"] - group_end
-            # Allow gap of up to 15 chars for ", MD" or middle initials etc.
             if gap > 15:
                 break
-            
-            # Check gap only contains expected chars
+
             gap_text = text[group_end:next_ent["start"]]
-            # Allow spaces, punctuation, and single uppercase letters (initials)
-            if gap_text and not re.match(r'^[\s.,\-\']+[A-Z]?\.?[\s.,\-\']*$|^[\s.,\-\']*$', gap_text):
+            if gap_text and not re.match(
+                r'^[\s.,\-\']+[A-ZÀ-Ú]?\.?[\s.,\-\']*$|^[\s.,\-\']*$', gap_text
+            ):
                 break
-            
+
             group_end = next_ent["end"]
             j += 1
-        
+
         if j > i + 1:
-            # Combined multiple entities into one NAME
             combined_text = text[group_start:group_end]
             combined.append({
                 "type": "NAME",
                 "start": group_start,
                 "end": group_end,
-                "text": combined_text
+                "text": combined_text,
             })
             i = j
         else:
-            # Single name entity - keep as-is but will be handled by normalize_name
             combined.append(curr.copy())
             i += 1
-    
+
     return combined
 
 
-class ClinicalDeidentifier:
+class PIIDeidentifier:
     def __init__(self, seed: Optional[int] = None):
-        self.fake = Faker('en_US')
+        self.fake = Faker('pt_BR')
         if seed is not None:
             Faker.seed(seed)
             random.seed(seed)
-        
-        # Cache for within-document consistency
+
         self._cache = {}
         self._date_shift = None
-        self._current_location = None  # For geographic consistency
-        # Track generated full names for first/last consistency
+        self._current_location = None
         self._full_name_cache = {}
-        
+
     def reset_cache(self):
         """Call between documents to reset consistency caches."""
         self._cache = {}
-        self._date_shift = random.randint(-365, -30)  # Shift 1-12 months back
+        self._date_shift = random.randint(-365, -30)
         self._current_location = None
         self._full_name_cache = {}
-    
+
     def _get_cached(self, original: str, entity_type: str, generator_fn):
         """Ensure consistent replacement within a document."""
-        # Use normalized key for names so variants map to same fake
-        if entity_type in ("FIRST_NAME", "LAST_NAME", "NAME"):
+        if entity_type in ("FIRST_NAME", "MIDDLE_NAME", "LAST_NAME", "NAME"):
             norm = normalize_name(original)
             key = f"NAME:{norm}"
         else:
             key = f"{entity_type}:{original.strip()}"
-        
+
         if key not in self._cache:
             self._cache[key] = generator_fn()
         return self._cache[key]
-    
+
     def _preserve_case(self, original: str, replacement: str) -> str:
         """Match the case pattern of the original text."""
         if original.isupper():
@@ -236,435 +141,249 @@ class ClinicalDeidentifier:
             return replacement.lower()
         elif original.istitle():
             return replacement.title()
-        else:
-            return replacement
-    
+        return replacement
+
     def replace(self, text: str, entity_type: str) -> str:
-        """Replace detected PHI with realistic surrogate data."""
-        
+        """Replace detected PII with realistic surrogate data."""
+
+        # === SENSITIVE DATA — redact, don't generate surrogates ===
+        if entity_type in SENSITIVE_ENTITY_TYPES:
+            return SENSITIVE_REDACTION_MARKER
+
         # === NAMES ===
         if entity_type == "FIRST_NAME":
             replacement = self._get_cached(text, entity_type, self.fake.first_name)
             return self._preserve_case(text, replacement)
-        
+
+        elif entity_type == "MIDDLE_NAME":
+            replacement = self._get_cached(text, entity_type, self.fake.first_name)
+            return self._preserve_case(text, replacement)
+
         elif entity_type == "LAST_NAME":
             replacement = self._get_cached(text, entity_type, self.fake.last_name)
             return self._preserve_case(text, replacement)
-        
+
         elif entity_type == "NAME":
-            # Full name - generate first + last
             replacement = self._get_cached(text, entity_type, self.fake.name)
             return self._preserve_case(text, replacement)
-        
-        # === DATES ===
-        elif entity_type == "DATE":
-            return self._shift_date(text)
-        
+
+        # === DATE OF BIRTH ===
         elif entity_type == "DATE_OF_BIRTH":
             return self._generate_dob(text)
-        
-        elif entity_type == "DATE_TIME":
-            return self._shift_datetime(text)
-        
-        elif entity_type == "TIME":
-            # Time alone is not PHI per HIPAA Safe Harbor
-            return text
-        
-        # === AGE ===
-        elif entity_type == "AGE":
-            return self._generalize_age(text)
-        
-        # === IDENTIFIERS ===
-        elif entity_type == "SSN":
-            return self._generate_ssn(text)
-        
-        elif entity_type == "MEDICAL_RECORD_NUMBER":
-            return self._generate_mrn(text)
-        
-        elif entity_type == "HEALTH_PLAN_BENEFICIARY_NUMBER":
-            return self._generate_id(text, prefix="HPBN")
-        
-        elif entity_type == "ACCOUNT_NUMBER":
-            return self._generate_id(text, prefix="ACCT")
-        
-        elif entity_type == "CUSTOMER_ID":
-            return self._generate_id(text, prefix="CID")
-        
-        elif entity_type == "EMPLOYEE_ID":
-            return self._generate_id(text, prefix="EMP")
-        
-        elif entity_type == "UNIQUE_ID":
-            return self._generate_id(text, prefix="UID")
-        
-        elif entity_type == "CERTIFICATE_LICENSE_NUMBER":
-            return self._generate_license(text)
-        
-        elif entity_type == "BIOMETRIC_IDENTIFIER":
-            return self._generate_id(text, prefix="BIO")
-        
-        elif entity_type == "NPI":
-            # National Provider Identifier (unique clinician ID)
-            return self._generate_npi(text)
-        
-        elif entity_type in ("GROUP_NUMBER", "INSURANCE_GROUP_NUMBER", "GROUP_ID"):
-            # Insurance group number / plan group id
-            return self._generate_id(text, prefix="GRP")
-        
+
+        # === BRAZILIAN DOCUMENTS ===
+        elif entity_type == "CPF":
+            return self._get_cached(text, entity_type, self._generate_cpf)
+
+        elif entity_type == "RG":
+            return self._get_cached(text, entity_type, self._generate_rg)
+
+        elif entity_type == "PIS":
+            return self._get_cached(text, entity_type, self._generate_pis)
+
+        elif entity_type == "CREDIT_CARD":
+            return self._get_cached(text, entity_type, self._generate_credit_card)
+
         # === CONTACT INFO ===
         elif entity_type == "PHONE_NUMBER":
-            return self._generate_phone(text)
-        
-        elif entity_type == "FAX_NUMBER":
-            return self._generate_phone(text)  # Same format as phone
-        
+            return self._generate_brazilian_phone(text)
+
         elif entity_type == "EMAIL":
             return self._get_cached(text, entity_type, self._generate_email)
-        
+
         # === ADDRESSES ===
         elif entity_type == "STREET_ADDRESS":
             return self._get_cached(text, entity_type, self._generate_street)
-        
+
+        elif entity_type == "BUILDING_NUMBER":
+            return str(random.randint(1, 9999))
+
+        elif entity_type == "NEIGHBORHOOD":
+            return self._get_cached(
+                text, entity_type,
+                lambda: self.fake.bairro() if hasattr(self.fake, 'bairro') else self.fake.city_suffix() + " " + self.fake.last_name()
+            )
+
         elif entity_type == "CITY":
             return self._get_cached(text, entity_type, self._generate_city)
-        
-        elif entity_type == "COUNTY":
-            return self._get_cached(text, entity_type, lambda: self.fake.city() + " County")
-        
+
         elif entity_type == "STATE":
-            # State alone is generally allowed per HIPAA, but replace if detected
-            return self._get_location()[1]  # Get consistent state
-        
-        elif entity_type == "POSTCODE":
-            return self._generalize_zip(text)
-        
-        elif entity_type == "COUNTRY":
-            # Country is allowed per HIPAA
-            return text
-        
+            return self._get_location()[1]
+
+        elif entity_type == "CEP":
+            return self._get_cached(text, entity_type, self._generate_cep)
+
         # === FALLBACK ===
         else:
-            # Unknown type - generate generic ID
-            return self._generate_id(text, prefix="ID")
-    
+            return self._generate_generic_id(text)
+
+    # === BRAZILIAN DOCUMENT GENERATORS ===
+
+    def _generate_cpf(self) -> str:
+        """Generate fake CPF in format XXX.XXX.XXX-XX."""
+        digits = [random.randint(0, 9) for _ in range(9)]
+        # Calculate first check digit
+        s = sum(d * w for d, w in zip(digits, range(10, 1, -1)))
+        d1 = 11 - (s % 11)
+        d1 = 0 if d1 >= 10 else d1
+        digits.append(d1)
+        # Calculate second check digit
+        s = sum(d * w for d, w in zip(digits, range(11, 1, -1)))
+        d2 = 11 - (s % 11)
+        d2 = 0 if d2 >= 10 else d2
+        digits.append(d2)
+        return f"{digits[0]}{digits[1]}{digits[2]}.{digits[3]}{digits[4]}{digits[5]}.{digits[6]}{digits[7]}{digits[8]}-{digits[9]}{digits[10]}"
+
+    def _generate_rg(self) -> str:
+        """Generate fake RG in format XX.XXX.XXX-X."""
+        d = [random.randint(0, 9) for _ in range(8)]
+        check = random.randint(0, 9)
+        return f"{d[0]}{d[1]}.{d[2]}{d[3]}{d[4]}.{d[5]}{d[6]}{d[7]}-{check}"
+
+    def _generate_pis(self) -> str:
+        """Generate fake PIS/PASEP in format XXX.XXXX.XXX-X."""
+        d = [random.randint(0, 9) for _ in range(10)]
+        check = random.randint(0, 9)
+        return f"{d[0]}{d[1]}{d[2]}.{d[3]}{d[4]}{d[5]}{d[6]}.{d[7]}{d[8]}{d[9]}-{check}"
+
+    def _generate_cep(self) -> str:
+        """Generate fake CEP in format XXXXX-XXX."""
+        return f"{random.randint(10000, 99999)}-{random.randint(100, 999)}"
+
+    def _generate_credit_card(self) -> str:
+        """Generate fake credit card in format XXXX XXXX XXXX XXXX."""
+        groups = [f"{random.randint(1000, 9999)}" for _ in range(4)]
+        return " ".join(groups)
+
+    def _generate_brazilian_phone(self, original: str) -> str:
+        """Generate fake Brazilian phone number, preserving format."""
+        original = original.strip()
+        ddd = random.randint(11, 99)
+        number = random.randint(90000, 99999) * 10000 + random.randint(0, 9999)
+        first = number // 10000
+        last = number % 10000
+
+        # Detect format from original
+        if re.match(r'\(\d{2}\)\s*\d{4,5}[-.]?\d{4}', original):
+            return f"({ddd:02d}) {first}-{last:04d}"
+        elif re.match(r'\d{2}\s*\d{4,5}[-.]?\d{4}', original):
+            return f"{ddd:02d} {first}-{last:04d}"
+        elif re.match(r'\+55', original):
+            return f"+55 ({ddd:02d}) {first}-{last:04d}"
+        else:
+            return f"({ddd:02d}) {first}-{last:04d}"
+
     # === DATE HANDLING ===
-    
-    def _shift_date(self, text: str) -> str:
-        """Shift date by consistent offset, preserving original format."""
-        if self._date_shift is None:
-            self._date_shift = random.randint(-365, -30)
-        
-        text = text.strip()
-        
-        # Try to parse and shift the date
-        parsed = self._parse_date(text)
-        if parsed:
-            dt, fmt = parsed
-            shifted = dt + timedelta(days=self._date_shift)
-            return shifted.strftime(fmt)
-        
-        # Couldn't parse - apply consistent shift to a reference date
-        # This maintains temporal consistency even for unparseable dates
-        # Use a reference date and apply the same shift
-        reference_date = datetime(2025, 1, 15)  # Fixed reference
-        shifted = reference_date + timedelta(days=self._date_shift)
-        return shifted.strftime("%m/%d/%Y")
-    
+
     def _generate_dob(self, text: str) -> str:
         """Generate realistic DOB preserving approximate age (±2 years)."""
         parsed = self._parse_date(text)
         if parsed:
             dt, fmt = parsed
-            # Small year jitter (±2 years) to preserve approximate age
             year_jitter = random.randint(-2, 2)
-            # Random month and day
             new_month = random.randint(1, 12)
-            new_day = random.randint(1, 28)  # Safe for all months
-            
+            new_day = random.randint(1, 28)
             try:
                 shifted = dt.replace(year=dt.year + year_jitter, month=new_month, day=new_day)
                 return shifted.strftime(fmt)
             except ValueError:
-                # Handle edge cases
                 shifted = dt.replace(year=dt.year + year_jitter, month=new_month, day=15)
                 return shifted.strftime(fmt)
-        
-        # Couldn't parse - generate realistic adult DOB
-        return self.fake.date_of_birth(minimum_age=18, maximum_age=90).strftime("%m/%d/%Y")
-    
-    def _shift_datetime(self, text: str) -> str:
-        """Shift datetime, preserving format including time."""
+        return self.fake.date_of_birth(minimum_age=18, maximum_age=90).strftime("%d/%m/%Y")
+
+    def _shift_date(self, text: str) -> str:
+        """Shift date by consistent offset, preserving original format."""
         if self._date_shift is None:
             self._date_shift = random.randint(-365, -30)
-        
+
         text = text.strip()
-        
-        # Common datetime formats
-        datetime_formats = [
-            ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"),
-            ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M"),
-            ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S"),
-            ("%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M"),
-            ("%m/%d/%y %H:%M", "%m/%d/%y %H:%M"),
-            ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S"),
-            ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%SZ"),
-        ]
-        
-        for parse_fmt, out_fmt in datetime_formats:
-            try:
-                dt = datetime.strptime(text, parse_fmt)
-                shifted = dt + timedelta(days=self._date_shift)
-                return shifted.strftime(out_fmt)
-            except ValueError:
-                continue
-        
-        # Try date-only parsing
-        return self._shift_date(text)
-    
+        parsed = self._parse_date(text)
+        if parsed:
+            dt, fmt = parsed
+            shifted = dt + timedelta(days=self._date_shift)
+            return shifted.strftime(fmt)
+
+        reference_date = datetime(2025, 1, 15)
+        shifted = reference_date + timedelta(days=self._date_shift)
+        return shifted.strftime("%d/%m/%Y")
+
     def _parse_date(self, text: str) -> Optional[Tuple[datetime, str]]:
         """Parse date and return (datetime, format_string)."""
-        # Order matters - try more specific formats first
         formats = [
-            # ISO formats
-            ("%Y-%m-%d", "%Y-%m-%d"),
-            # US formats
-            ("%m/%d/%Y", "%m/%d/%Y"),
-            ("%m-%d-%Y", "%m-%d-%Y"),
-            ("%m/%d/%y", "%m/%d/%y"),
-            ("%m-%d-%y", "%m-%d-%y"),
-            # Written formats
-            ("%B %d, %Y", "%B %d, %Y"),
-            ("%b %d, %Y", "%b %d, %Y"),
-            ("%d %B %Y", "%d %B %Y"),
-            ("%d %b %Y", "%d %b %Y"),
-            # European formats
+            # Brazilian formats (DD/MM/YYYY)
             ("%d/%m/%Y", "%d/%m/%Y"),
             ("%d-%m-%Y", "%d-%m-%Y"),
-            # Other
-            ("%Y%m%d", "%Y%m%d"),
+            ("%d/%m/%y", "%d/%m/%y"),
+            ("%d-%m-%y", "%d-%m-%y"),
+            # ISO formats
+            ("%Y-%m-%d", "%Y-%m-%d"),
+            # Written formats (Portuguese)
+            ("%d de %B de %Y", "%d de %B de %Y"),
+            # US formats (less common but possible in data)
+            ("%m/%d/%Y", "%m/%d/%Y"),
         ]
-        
+
         for parse_fmt, out_fmt in formats:
             try:
                 dt = datetime.strptime(text.strip(), parse_fmt)
-                # Sanity check - year should be reasonable
                 if 1900 <= dt.year <= 2100:
                     return (dt, out_fmt)
             except ValueError:
                 continue
-        
-        # Try regex for partial dates like "12/07/25" (with year)
+
+        # Try regex for dates like "15/03/1990" with flexible separators
         match = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', text)
         if match:
-            m, d, y = match.groups()
+            d, m, y = match.groups()
             try:
                 if len(y) == 2:
                     y = "20" + y if int(y) < 50 else "19" + y
                 dt = datetime(int(y), int(m), int(d))
-                # Preserve original format
                 sep = "/" if "/" in text else "-"
                 if len(match.group(3)) == 2:
-                    fmt = f"%m{sep}%d{sep}%y"
+                    fmt = f"%d{sep}%m{sep}%y"
                 else:
-                    fmt = f"%m{sep}%d{sep}%Y"
+                    fmt = f"%d{sep}%m{sep}%Y"
                 return (dt, fmt)
             except ValueError:
                 pass
-        
-        # Try regex for SHORT dates like "12/13" or "12/15" (MM/DD without year)
-        # Assume current year for these clinical encounter dates
-        short_match = re.match(r'^(\d{1,2})[/\-](\d{1,2})$', text.strip())
-        if short_match:
-            m, d = short_match.groups()
-            try:
-                current_year = datetime.now().year
-                dt = datetime(current_year, int(m), int(d))
-                sep = "/" if "/" in text else "-"
-                # Use short format (no year) to preserve original appearance
-                fmt = f"%m{sep}%d"
-                return (dt, fmt)
-            except ValueError:
-                pass
-        
+
         return None
-    
-    # === IDENTIFIER GENERATION ===
-    
-    def _generate_ssn(self, original: str) -> str:
-        """Generate fake SSN preserving format."""
-        # Detect format
-        if re.match(r'\d{3}-\d{2}-\d{4}', original):
-            return f"{random.randint(100,999)}-{random.randint(10,99)}-{random.randint(1000,9999)}"
-        elif re.match(r'\d{9}', original):
-            return f"{random.randint(100000000, 999999999)}"
-        else:
-            # Default formatted
-            return f"{random.randint(100,999)}-{random.randint(10,99)}-{random.randint(1000,9999)}"
-    
-    def _generate_mrn(self, original: str) -> str:
-        """Generate fake MRN matching original format/length."""
-        original = original.strip()
-        
-        # Extract any prefix (letters at start)
-        prefix_match = re.match(r'^([A-Za-z]+)[-_]?', original)
-        prefix = prefix_match.group(1) if prefix_match else "MRN"
-        
-        # Count digits in original
-        digits = re.findall(r'\d', original)
-        num_digits = len(digits) if digits else 8
-        
-        # Detect separator
-        sep = "-" if "-" in original else ""
-        
-        # Generate new number with same digit count
-        new_num = ''.join([str(random.randint(0, 9)) for _ in range(num_digits)])
-        
-        return f"{prefix}{sep}{new_num}"
-    
-    def _generate_id(self, original: str, prefix: str = "ID") -> str:
-        """Generate fake ID preserving approximate length."""
-        original = original.strip()
-        
-        # Count alphanumeric characters
-        alphanum = re.findall(r'[A-Za-z0-9]', original)
-        length = len(alphanum) if alphanum else 8
-        
-        # Generate random alphanumeric of similar length
-        chars = ''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=max(4, length)))
-        
-        return chars
-    
-    def _generate_npi(self, original: str) -> str:
-        """Generate fake NPI (National Provider Identifier)."""
-        original = original.strip()
-        
-        # NPI is always 10 digits
-        # But preserve format if there's a prefix
-        prefix_match = re.match(r'^([A-Za-z]+)[-_:\s]*', original)
-        if prefix_match:
-            prefix = prefix_match.group(1)
-            return f"{prefix}{random.randint(1000000000, 9999999999)}"
-        
-        # Standard 10-digit NPI
-        return str(random.randint(1000000000, 9999999999))
-    
-    def _generate_license(self, original: str) -> str:
-        """Generate fake license/certificate number."""
-        original = original.strip()
-        
-        # Try to match format (letters + numbers pattern)
-        letters = len(re.findall(r'[A-Za-z]', original))
-        numbers = len(re.findall(r'\d', original))
-        
-        if letters > 0 and numbers > 0:
-            letter_part = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=letters))
-            number_part = ''.join(random.choices('0123456789', k=numbers))
-            return f"{letter_part}{number_part}"
-        elif numbers > 0:
-            return ''.join(random.choices('0123456789', k=max(6, numbers)))
-        else:
-            return self.fake.bothify(text="??######")
-    
+
     # === CONTACT GENERATION ===
-    
-    def _generate_phone(self, original: str) -> str:
-        """Generate fake phone number preserving format."""
-        original = original.strip()
-        
-        # Generate base phone number
-        area = random.randint(200, 999)
-        exchange = random.randint(200, 999)
-        subscriber = random.randint(1000, 9999)
-        
-        # Detect format from original
-        if re.match(r'\(\d{3}\)\s*\d{3}[-.]?\d{4}', original):
-            # (123) 456-7890
-            sep = "-" if "-" in original else ("." if "." in original else "-")
-            space = " " if " " in original[5:8] else ""
-            return f"({area}){space}{exchange}{sep}{subscriber}"
-        
-        elif re.match(r'\d{3}[-.]?\d{3}[-.]?\d{4}', original):
-            # 123-456-7890 or 123.456.7890
-            sep = "-" if "-" in original else ("." if "." in original else "-")
-            return f"{area}{sep}{exchange}{sep}{subscriber}"
-        
-        elif re.match(r'\d{10}', original):
-            # 1234567890
-            return f"{area}{exchange}{subscriber}"
-        
-        elif re.match(r'\+?1?\s*\(?\d{3}\)?', original):
-            # +1 (123) 456-7890 or similar
-            return f"+1 ({area}) {exchange}-{subscriber}"
-        
-        else:
-            # Default format
-            return f"({area}) {exchange}-{subscriber}"
-    
+
     def _generate_email(self) -> str:
         """Generate realistic email."""
         return self.fake.email()
-    
+
     # === ADDRESS GENERATION ===
-    
+
     def _get_location(self) -> Tuple[str, str, str]:
-        """Get consistent city, state, zip for this document."""
+        """Get consistent city, state, CEP for this document."""
         if self._current_location is None:
-            # Generate a consistent location
             city = self.fake.city()
             state = self.fake.state_abbr()
-            zipcode = self.fake.zipcode()
-            self._current_location = (city, state, zipcode)
+            cep = self._generate_cep()
+            self._current_location = (city, state, cep)
         return self._current_location
-    
+
     def _generate_street(self) -> str:
         """Generate realistic street address."""
-        return self.fake.street_address()
-    
+        return self.fake.street_name()
+
     def _generate_city(self) -> str:
         """Generate city (consistent within document)."""
         return self._get_location()[0]
-    
-    def _generalize_zip(self, original: str) -> str:
-        """
-        Per HIPAA Safe Harbor: 
-        - Keep first 3 digits if population >20,000
-        - Otherwise generalize to 000XX
-        In practice, we generate a fake zip with same format.
-        """
+
+    # === GENERIC FALLBACK ===
+
+    def _generate_generic_id(self, original: str) -> str:
+        """Generate fake ID preserving approximate length."""
         original = original.strip()
-        
-        # Generate fake zip
-        fake_zip = self.fake.zipcode()
-        
-        # Match format
-        if re.match(r'\d{5}-\d{4}', original):
-            # ZIP+4 format
-            return f"{fake_zip[:5]}-{random.randint(1000, 9999)}"
-        elif re.match(r'\d{5}', original):
-            return fake_zip[:5]
-        elif re.match(r'\d{3}', original):
-            # Just first 3 digits
-            return fake_zip[:3]
-        else:
-            return fake_zip[:5]
-    
-    # === AGE HANDLING ===
-    
-    def _generalize_age(self, original: str) -> str:
-        """
-        HIPAA Safe Harbor requires ages 90+ to be generalized.
-        We generalize 89+ to be safe.
-        """
-        try:
-            # Extract numeric age
-            match = re.search(r'\d+', original)
-            if match:
-                age = int(match.group())
-                if age >= 89:
-                    # Replace the number with "90+"
-                    return re.sub(r'\d+', '90+', original)
-            return original
-        except:
-            return original
+        alphanum = re.findall(r'[A-Za-z0-9]', original)
+        length = len(alphanum) if alphanum else 8
+        chars = ''.join(random.choices('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', k=max(4, length)))
+        return chars
 
 
 # === Utility for batch processing ===
@@ -672,46 +391,28 @@ class ClinicalDeidentifier:
 def deidentify_text(text: str, entities: list, seed: int = None) -> str:
     """
     Replace entities in text with surrogate data.
-    
+
     Args:
-        text: Original clinical text
+        text: Original text
         entities: List of dicts with 'type', 'start', 'end', 'text' keys
         seed: Random seed for reproducibility
-    
+
     Returns:
         De-identified text
     """
-    deid = ClinicalDeidentifier(seed=seed)
+    deid = PIIDeidentifier(seed=seed)
     deid.reset_cache()
-    
-    # Pre-process: Merge fragmented DATE entities back together
-    # Model sometimes splits "03/15/1965" into "03", "/", "15", etc.
-    entities = _merge_adjacent_date_entities(entities, text)
-    
-    # Pre-process: Combine adjacent FIRST_NAME/LAST_NAME into single NAME entities
-    # This ensures "Sarah" + "Johnson" gets same cache key as "Sarah Elizabeth Johnson"
+
+    # Pre-process: Combine adjacent name entities for cache consistency
     entities = _combine_adjacent_name_entities(entities, text)
-    
+
     # Sort by start position (reverse) for safe replacement
     sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
-    
+
     result = text
     for entity in sorted_entities:
         entity_type = entity["type"]
-        
-        # Context-aware DOB detection: if DATE entity follows "DOB:" treat as DATE_OF_BIRTH
-        # This preserves patient age since model doesn't distinguish DOB from other dates
-        if entity_type == "DATE":
-            # Look at 50 chars before entity for DOB context
-            lookback_start = max(0, entity["start"] - 50)
-            context = text[lookback_start:entity["start"]].lower()
-            if "dob:" in context or "dob :" in context or "date of birth" in context or "birth date" in context or "birthdate" in context:
-                entity_type = "DATE_OF_BIRTH"
-        
         replacement = deid.replace(entity["text"], entity_type)
         result = result[:entity["start"]] + replacement + result[entity["end"]:]
-    
-    # Post-process DOB line(s) to keep a single clean date
-    result = _clean_dob_lines(result)
-    
+
     return result

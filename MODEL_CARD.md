@@ -1,20 +1,19 @@
 ---
 license: apache-2.0
 language:
-- en
+- pt
 library_name: transformers
 tags:
-- medical
-- clinical
+- pii
+- lgpd
 - ner
 - de-identification
-- phi
-- hipaa
-- healthcare
+- brazilian-portuguese
 - token-classification
+- privacy
 datasets:
-- nvidia/Nemotron-PII
-base_model: yikuan8/Clinical-Longformer
+- custom
+base_model: allenai/longformer-base-4096
 metrics:
 - f1
 - precision
@@ -22,38 +21,33 @@ metrics:
 pipeline_tag: token-classification
 ---
 
-# Clinical-Deid: Clinical Text De-identification
+# pii-longformer-br: Brazilian Portuguese PII Detection
 
-**97.74% F1** on PHI detection — outperforms AWS Comprehend Medical (83%) and John Snow Labs (96%)
+PII detection and removal for Brazilian Portuguese text using a fine-tuned Longformer model with BILOU tagging.
 
 ## Model Description
 
-Clinical-Deid is a fine-tuned [Clinical-Longformer](https://huggingface.co/yikuan8/Clinical-Longformer) model for detecting and removing Protected Health Information (PHI) from clinical notes. It uses BILOU tagging to identify 25 PHI entity types.
+This model detects 22 types of Personally Identifiable Information in Portuguese text, including Brazilian-specific document types (CPF, RG, PIS) and LGPD-sensitive categories (medical data, sexual data, race, religion, political opinion).
 
-### Key Features
+Detected PII is replaced with realistic surrogate data (for structured types) or redaction markers (for sensitive types), preserving text readability.
 
-- 🎯 **97.74% F1 Score** — State-of-the-art accuracy
-- 📄 **4,096 token context** — Handle full clinical notes
-- 🏥 **25 PHI categories** — All HIPAA identifiers covered
-- ⚡ **Fast inference** — ~100ms per note on GPU
+## Entity Types
 
-## Performance
+### Structured PII (16 types)
 
-| Metric | Value |
-|--------|-------|
-| **F1 Score** | 97.74% |
-| **Precision** | 96.08% |
-| **Recall** | 99.46% |
+| Category | Types |
+|----------|-------|
+| Names | FIRST_NAME, MIDDLE_NAME, LAST_NAME |
+| Documents | CPF, RG, PIS, CREDIT_CARD |
+| Contact | PHONE_NUMBER, EMAIL |
+| Address | STREET_ADDRESS, BUILDING_NUMBER, NEIGHBORHOOD, CITY, STATE, CEP |
+| Dates | DATE_OF_BIRTH |
 
-### Comparison
+### Sensitive Data (6 types)
 
-| Solution | F1 Score | Cost/1M Notes |
-|----------|----------|---------------|
-| GPT-4o | 79% | $21,400 |
-| AWS Comprehend Medical | 83% | $14,525 |
-| Azure Health Services | 91% | $13,125 |
-| John Snow Labs | 96% | $2,500 |
-| **Clinical-Deid** | **97.74%** | **$0** |
+MEDICAL_DATA, SEXUAL_DATA, RACE_OR_ETHNICITY, RELIGIOUS_CONVICTION, POLITICAL_OPINION, ORGANIZATION_AFFILIATION
+
+Total: 89 labels (22 entity types x 4 BILOU tags + O)
 
 ## Usage
 
@@ -61,25 +55,16 @@ Clinical-Deid is a fine-tuned [Clinical-Longformer](https://huggingface.co/yikua
 from transformers import AutoModelForTokenClassification, AutoTokenizer
 import torch
 
-# Load model
-model = AutoModelForTokenClassification.from_pretrained("riggsmedai/clinical-deid")
-tokenizer = AutoTokenizer.from_pretrained("riggsmedai/clinical-deid")
+model = AutoModelForTokenClassification.from_pretrained("path/to/model")
+tokenizer = AutoTokenizer.from_pretrained("path/to/model")
 
-# Example clinical note
-text = """
-PROGRESS NOTE
-Patient: John Smith  DOB: 03/15/1952  MRN: 123456789
-Dr. Sarah Johnson evaluated the patient today.
-Assessment: 72 year old male with pneumonia.
-"""
+text = "Maria Silva, CPF 123.456.789-00, mora na Rua Augusta, 1234, Sao Paulo - SP."
 
-# Tokenize and predict
 inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
 with torch.no_grad():
     outputs = model(**inputs)
     predictions = torch.argmax(outputs.logits, dim=-1)[0]
 
-# Get labels
 id2label = model.config.id2label
 tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
 
@@ -89,53 +74,19 @@ for token, pred in zip(tokens, predictions):
         print(f"{token}: {label}")
 ```
 
-## PHI Categories Detected
-
-| Category | BILOU Labels |
-|----------|--------------|
-| Names | B/I/L/U-name |
-| Dates | B/I/L/U-date |
-| Ages | B/I/L/U-age |
-| Addresses | B/I/L/U-address |
-| Phone Numbers | B/I/L/U-phone_number |
-| Email | B/I/L/U-email |
-| SSN | B/I/L/U-social_security_number |
-| MRN | B/I/L/U-medical_record_number |
-| ... and 17 more | |
-
-Total: 101 labels (25 entity types × 4 BILOU tags + O)
-
 ## Training Details
 
-- **Base model**: yikuan8/Clinical-Longformer
-- **Training data**: NVIDIA Nemotron-PII healthcare subset (3,630 records)
-- **Epochs**: 10
-- **Best checkpoint**: Epoch 10
-- **Hardware**: NVIDIA RTX 5090 (32GB VRAM)
+- **Base model**: allenai/longformer-base-4096 (configurable; multilingual variant recommended for Portuguese)
+- **Training data**: Brazilian Portuguese PII dataset (~50K records sampled from 650K)
+- **Tagging scheme**: BILOU
+- **Max sequence length**: 4,096 tokens
 
 ## Limitations
 
-1. **Trained on synthetic data** — Real-world F1 may be 90-95%
-2. **English only** — Not tested on other languages
-3. **US healthcare focus** — May miss international formats
-
-## Citation
-
-```bibtex
-@software{clinical_deid_2025,
-  author = {Riggs, Gary},
-  title = {Clinical-Deid: Clinical Text De-identification},
-  year = {2025},
-  url = {https://huggingface.co/riggsmedai/clinical-deid}
-}
-```
+1. **Base model is English-only** — For best results, use `markussagen/xlm-roberta-longformer-base-4096` as the base
+2. **Trained on synthetic data** — Real-world performance may vary
+3. **Brazilian focus** — Optimized for Brazilian Portuguese documents and ID formats
 
 ## License
 
-Apache 2.0 — See [COMMERCIAL_LICENSE.md](https://github.com/riggsmedai/clinical-deid/blob/main/COMMERCIAL_LICENSE.md) for commercial use terms.
-
-## Links
-
-- **GitHub**: [github.com/riggsmedai/clinical-deid](https://github.com/riggsmedai/clinical-deid)
-- **API**: [deid.riggsmedai.com](https://deid.riggsmedai.com)
-- **Contact**: riggsmed@gmail.com
+Apache 2.0

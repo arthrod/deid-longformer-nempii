@@ -4,3 +4,8 @@ fastapi
 uvicorn[standard]
 pydantic
 faker
+datasets
+scikit-learn
+tqdm
+numpy
+huggingface-hub

@@ -1,249 +1,195 @@
-# deid-LONGFORMER-NemPII
+# pii-longformer-br
 
-**HIPAA-compliant clinical de-identification that beats commercial solutions—at zero cost.**
+**General-purpose PII removal for Brazilian Portuguese text using Longformer.**
 
-A fine-tuned Clinical-Longformer model for Protected Health Information (PHI) detection and replacement in clinical text, achieving **97.74% F1** on held-out test data.
+A fine-tuned Longformer model for detecting and replacing Personally Identifiable Information (PII) in Portuguese text, supporting 22 entity types including Brazilian documents (CPF, RG, PIS) and LGPD-sensitive categories.
 
 ## Why This Exists
 
-Commercial de-identification solutions are expensive and produce unusable output:
+Brazilian data protection law (LGPD - Lei Geral de Protecao de Dados) requires organizations to protect personal data. This model automates PII detection and generates **realistic surrogate data** instead of simple redaction, preserving text readability for downstream NLP tasks.
 
-| Solution | F1 Score | Cost | Replacement Quality |
-|----------|----------|------|---------------------|
-| AWS Comprehend Medical | ~83-93% | $14.5K/1M notes | Basic placeholders |
-| John Snow Labs | 96-97% | Enterprise license | Basic placeholders |
-| **deid-LONGFORMER-NemPII** | **97.74%** | **Free/self-hosted** | **Realistic surrogates** |
+## Entity Types
 
-Most tools just redact PHI with `[REDACTED]` or `***`, leaving text that's difficult to read and impossible to use for downstream NLP tasks. This model generates **realistic surrogate data** that preserves clinical meaning while protecting patient privacy.
+### Structured PII (16 types, always active)
 
-## Acknowledgments
+| Entity | Description | Example |
+|--------|-------------|---------|
+| FIRST_NAME | First name | Maria |
+| MIDDLE_NAME | Middle name | Elizabeth |
+| LAST_NAME | Last name / surnames | Silva |
+| DATE_OF_BIRTH | Date of birth | 15/03/1990 |
+| PHONE_NUMBER | Phone number | (11) 98765-4321 |
+| EMAIL | Email address | maria@example.com |
+| CPF | Cadastro de Pessoa Fisica | 123.456.789-00 |
+| RG | Registro Geral | 12.345.678-9 |
+| PIS | PIS/PASEP number | 123.4567.890-1 |
+| CEP | Postal code (CEP) | 01310-100 |
+| STREET_ADDRESS | Street name | Rua Augusta |
+| BUILDING_NUMBER | Building number | 1234 |
+| NEIGHBORHOOD | Neighborhood | Consolacao |
+| CITY | City name | Sao Paulo |
+| STATE | State / state abbreviation | SP |
+| CREDIT_CARD | Credit card number | 4111 1111 1111 1111 |
 
-This project stands on the shoulders of excellent prior work:
+### Sensitive Data (6 types, optional via config)
 
-### Inspiration: obi/deid_bert_i2b2
+| Entity | Description | Replacement |
+|--------|-------------|-------------|
+| MEDICAL_DATA | Medical/health information | [DADO SENSIVEL REMOVIDO] |
+| SEXUAL_DATA | Sexual orientation/behavior | [DADO SENSIVEL REMOVIDO] |
+| RACE_OR_ETHNICITY | Race or ethnicity | [DADO SENSIVEL REMOVIDO] |
+| RELIGIOUS_CONVICTION | Religious beliefs | [DADO SENSIVEL REMOVIDO] |
+| POLITICAL_OPINION | Political opinions | [DADO SENSIVEL REMOVIDO] |
+| ORGANIZATION_AFFILIATION | Organization membership | [DADO SENSIVEL REMOVIDO] |
 
-This model was directly inspired by [**obi/deid_bert_i2b2**](https://huggingface.co/obi/deid_bert_i2b2) from the Open Biomedical Informatics team (Prajwal Kailas, Max Homilius, Shinichi Goto). Their work on ClinicalBERT-based de-identification using the I2B2 2014 dataset demonstrated the viability of transformer-based approaches for this task. The [robust-deid](https://github.com/obi-ml-public/ehr_deidentification) framework they developed provided invaluable reference for architecture decisions and evaluation methodology.
-
-### Base Model: yikuan8/Clinical-Longformer
-
-The base model is [**yikuan8/Clinical-Longformer**](https://huggingface.co/yikuan8/Clinical-Longformer) by Li, Yikuan et al. This clinical knowledge-enriched Longformer was pre-trained on MIMIC-III clinical notes and supports sequences up to 4,096 tokens—critical for processing real-world clinical documents that often exceed BERT's 512-token limit.
-
-> Li, Yikuan, et al. "A comparative study of pretrained language models for long clinical text." *Journal of the American Medical Informatics Association* 30.2 (2023): 340-347.
-
-### Training Data: NVIDIA Nemotron-PII
-
-Training data comes from the healthcare subset of [**NVIDIA's Nemotron-PII**](https://huggingface.co/datasets/nvidia/Nemotron-PII) dataset (3,630 records, CC BY 4.0 license). This synthetic dataset provides diverse PHI patterns without exposing real patient data.
-
-## Key Differentiators
-
-Unlike competitors that just redact text, this system generates **clinically useful surrogates**:
-
-### Age-Preserving DOB Replacement
-Dates of birth are replaced with fake DOBs that preserve the patient's age within ±2 years. A 67-year-old patient stays clinically 65-69, not "[REDACTED]".
-
-### Context-Aware Detection
-The model recognizes that a DATE entity following "DOB:" should receive age-preserving treatment, not standard date shifting.
-
-### Name Consistency
-Multiple references to the same person map to the same fake name:
-- "Dr. Sarah Elizabeth Johnson, MD" → "Dr. Maria Rodriguez, MD"
-- "Sarah E. Johnson" → "Maria Rodriguez"
-- "Dr. Johnson" → "Dr. Rodriguez"
-
-### Temporal Consistency
-All dates in a document shift by the same random offset. If admission was January 15 and discharge was January 20, the 5-day relationship is preserved.
-
-### Geographic Consistency
-City, state, and ZIP code replacements are coherent—you won't get "Phoenix, NY 33101".
-
-### Format Preservation
-Phone numbers, SSNs, and dates maintain their original format:
-- `(555) 123-4567` → `(555) 987-6543` (not `5559876543`)
-- `01/15/2024` → `03/22/2024` (not `2024-03-22`)
-
-### Medical Term Protection
-A whitelist prevents false positives on medical terms:
-- "Anion Gap" stays "Anion Gap" (not replaced as a name)
-- "BUN" stays "BUN"
-- "2 weeks" stays "2 weeks" (not detected as a date)
-
-### Adjacent Entity Merging
-When the model fragments entities across tokens, post-processing merges them:
-- `["Jan", "uary", " ", "15"]` → `"January 15"` (single DATE entity)
+Sensitive data types are redacted with a marker rather than replaced with surrogates.
 
 ## Model Architecture
 
 ```
-Base Model:     yikuan8/Clinical-Longformer
-Parameters:     148M
+Base Model:     allenai/longformer-base-4096 (configurable)
 Max Length:     4,096 tokens
 Task:           Token Classification (NER)
 Tagging:        BILOU scheme
-Classes:        101 (25 PHI types × 4 BILOU tags + O)
+Classes:        89 (22 entity types x 4 BILOU tags + O)
 ```
 
-### PHI Categories (25 types)
+**Note:** `allenai/longformer-base-4096` is English-only. For better Portuguese performance, set the model to a multilingual variant:
 
+```bash
+# Recommended for Portuguese:
+python train.py --model_name markussagen/xlm-roberta-longformer-base-4096
 ```
-NAME, FIRST_NAME, LAST_NAME, DATE, DATE_OF_BIRTH, DATE_TIME,
-TIME, AGE, SSN, MEDICAL_RECORD_NUMBER, HEALTH_PLAN_BENEFICIARY_NUMBER,
-ACCOUNT_NUMBER, CERTIFICATE_LICENSE_NUMBER, PHONE_NUMBER, FAX_NUMBER,
-EMAIL, STREET_ADDRESS, CITY, STATE, POSTCODE, COUNTRY,
-BIOMETRIC_IDENTIFIER, UNIQUE_ID, CUSTOMER_ID, EMPLOYEE_ID
-```
+
+## Key Features
+
+### Brazilian Document Generation
+Generates valid-format surrogate CPFs, RGs, PIS numbers, CEPs, and Brazilian phone numbers.
+
+### Consistent Replacement
+Same PII within a document always maps to the same surrogate:
+- "Maria Silva" on line 1 and line 50 both become "Ana Oliveira"
+
+### Format Preservation
+Phone numbers, documents, and dates maintain their original format:
+- `(11) 98765-4321` -> `(21) 93456-7890`
+- `123.456.789-00` -> `987.654.321-00`
+- `15/03/1990` -> `22/07/1988`
+
+### Name Normalization
+Variants of the same person map to the same fake name:
+- "Dr. Maria Silva" -> "Dra. Ana Oliveira"
+- "Maria S." -> "Ana O."
+
+### LGPD Sensitive Data
+Sensitive categories (medical, sexual, racial, religious, political) are redacted rather than replaced with surrogates.
 
 ## Installation
 
 ```bash
-git clone https://github.com/Hrygt/deid-longformer-nempii.git
-cd deid-longformer-nempii
+git clone <repository-url>
+cd pii-longformer-br
 pip install -r requirements.txt
 ```
 
-Download model weights from HuggingFace:
+## Data Preparation
 
-```python
-from huggingface_hub import snapshot_download
-snapshot_download('riggsmed/deid-LONGFORMER-NemPII', local_dir='model')
+```bash
+# Sample 50K records from the full dataset
+python prepare_data.py \
+  --input /path/to/output_normalized.jsonl \
+  --output data/pii_dataset.jsonl \
+  --max-records 50000
 ```
 
-## Quick Start
+## Preprocessing
 
-### Python API
+```bash
+# Convert to BILOU token labels
+python preprocess.py \
+  --input data/pii_dataset.jsonl \
+  --output data/processed_bilou.jsonl \
+  --max-records 50000 \
+  --model-name allenai/longformer-base-4096
+```
+
+## Training
+
+```bash
+python train.py \
+  --data data/processed_bilou.jsonl \
+  --output checkpoints \
+  --epochs 10 \
+  --batch_size 4 \
+  --lr 5e-5 \
+  --model_name allenai/longformer-base-4096
+```
+
+## Quick Start (Python API)
 
 ```python
 from deid import deidentify_text
 
 text = """
-PATIENT: John Smith
-DOB: 01/15/1957
-MRN: 123456789
-
-Mr. Smith presented to the ED on 12/09/2024 with chest pain.
-Contact: (405) 555-1234
+Nome: Maria Elizabeth Silva
+CPF: 123.456.789-00
+Telefone: (11) 98765-4321
+Endereco: Rua Augusta, 1234 - Consolacao, Sao Paulo - SP, CEP 01310-100
 """
 
-result = deidentify_text(text)
-print(result["deidentified_text"])
+entities = [
+    {"type": "FIRST_NAME", "start": 6, "end": 11, "text": "Maria"},
+    {"type": "MIDDLE_NAME", "start": 12, "end": 21, "text": "Elizabeth"},
+    {"type": "LAST_NAME", "start": 22, "end": 27, "text": "Silva"},
+    {"type": "CPF", "start": 33, "end": 47, "text": "123.456.789-00"},
+    # ... more entities
+]
+
+result = deidentify_text(text, entities)
+print(result)
 ```
 
-Output:
-```
-PATIENT: Robert Johnson
-DOB: 03/22/1955
-MRN: 987654321
-
-Mr. Johnson presented to the ED on 02/15/2025 with chest pain.
-Contact: (555) 987-6543
-```
-
-### FastAPI Service
+## FastAPI Service
 
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8001
 ```
 
 ```bash
-curl -X POST http://localhost:8001/deidentify \
+curl -X POST http://localhost:8001/deid/process \
   -H "Content-Type: application/json" \
-  -d '{"text": "Patient John Smith, DOB 01/15/1957"}'
+  -d '{"text": "Nome: Maria Silva, CPF: 123.456.789-00"}'
 ```
 
-## Training
+## Configuration
 
-To train on your own data:
+### Sensitive Entity Toggle
+
+In `labels.py`, set `INCLUDE_SENSITIVE = False` to use only the 16 structured PII types (65 labels instead of 89).
+
+### Model Selection
+
+The base model is configurable via CLI args in both `preprocess.py` and `train.py`:
 
 ```bash
-python train.py \
-  --model_name yikuan8/Clinical-Longformer \
-  --train_file data/train.json \
-  --val_file data/val.json \
-  --output_dir checkpoints \
-  --epochs 10 \
-  --batch_size 4 \
-  --learning_rate 2e-5
+# English-only (default, faster)
+--model-name allenai/longformer-base-4096
+
+# Multilingual (recommended for Portuguese)
+--model-name markussagen/xlm-roberta-longformer-base-4096
 ```
-
-Data format (JSONL):
-```json
-{"text": "Patient John Smith...", "entities": [{"start": 8, "end": 18, "label": "NAME"}]}
-```
-
-## Evaluation Results
-
-Evaluated on 20% held-out split from Nemotron-PII healthcare subset:
-
-| Metric | Score |
-|--------|-------|
-| **F1** | **97.74%** |
-| Precision | 97.62% |
-| Recall | 97.86% |
-
-### Per-Entity Performance
-
-| Entity Type | F1 | Support |
-|-------------|-----|---------|
-| NAME | 98.2% | 1,247 |
-| DATE | 97.9% | 2,103 |
-| PHONE_NUMBER | 99.1% | 312 |
-| SSN | 98.7% | 89 |
-| STREET_ADDRESS | 96.4% | 445 |
-| ... | ... | ... |
-
-## Live Demo
-
-Try it at: **https://deid.riggsmedai.com**
 
 ## License
 
-- **Model weights**: Apache 2.0
-- **Code**: Apache 2.0
-- **Training data**: CC BY 4.0 (NVIDIA Nemotron-PII)
+Apache 2.0
 
-## Citation
+## Training Data
 
-If you use this model in your research, please cite:
+Brazilian Portuguese PII dataset (`output_normalized.jsonl`, ~650K records).
 
-```bibtex
-@software{riggs2024deid,
-  author = {Riggs, Gary},
-  title = {deid-LONGFORMER-NemPII: Clinical De-identification with Realistic Surrogates},
-  year = {2024},
-  url = {https://github.com/Hrygt/deid-longformer-nempii}
-}
-```
+## Acknowledgments
 
-And please also cite the foundational work this builds upon:
-
-```bibtex
-@article{li2023comparative,
-  title={A comparative study of pretrained language models for long clinical text},
-  author={Li, Yikuan and Wehbe, Ramsey M and Ahmad, Faraz S and Wang, Hanyin and Luo, Yuan},
-  journal={Journal of the American Medical Informatics Association},
-  volume={30},
-  number={2},
-  pages={340--347},
-  year={2023}
-}
-
-@misc{obi_deid,
-  author = {Kailas, Prajwal and Homilius, Max and Goto, Shinichi},
-  title = {Robust De-ID: De-Identification of Medical Notes using Transformer Architectures},
-  year = {2022},
-  url = {https://github.com/obi-ml-public/ehr_deidentification}
-}
-```
-
-## Author
-
-**Gary Riggs, MD**  
-Medical Director, Metro Physician Group  
-Master of Science in Data Science candidate, Northwestern University
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-*Built with ❤️ for healthcare AI that respects patient privacy.*
+- Base architecture: [allenai/longformer-base-4096](https://huggingface.co/allenai/longformer-base-4096)
+- Multilingual variant: [markussagen/xlm-roberta-longformer-base-4096](https://huggingface.co/markussagen/xlm-roberta-longformer-base-4096)
+- Original clinical de-identification system: [obi/deid_bert_i2b2](https://huggingface.co/obi/deid_bert_i2b2)
+- Surrogate generation approach inspired by [deid-LONGFORMER-NemPII](https://github.com/Hrygt/deid-longformer-nempii)

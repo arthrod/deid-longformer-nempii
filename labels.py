@@ -1,93 +1,110 @@
-# labels.py
+# labels.py - PII entity types for Brazilian Portuguese de-identification
 
-# 25 Core PHI entity types (matching your priority list)
-ENTITY_TYPES = [
-    # HIPAA Direct Identifiers
+# Configuration flag: set to False for structured-only PII (16 types)
+INCLUDE_SENSITIVE = True
+
+# 16 Structured PII types (always included)
+STRUCTURED_ENTITY_TYPES = [
     "FIRST_NAME",
-    "LAST_NAME", 
-    "SSN",
-    "MEDICAL_RECORD_NUMBER",
-    "HEALTH_PLAN_BENEFICIARY_NUMBER",
+    "MIDDLE_NAME",
+    "LAST_NAME",
     "DATE_OF_BIRTH",
-    
-    # Contact Info
     "PHONE_NUMBER",
-    "FAX_NUMBER",
     "EMAIL",
+    "CPF",
+    "RG",
+    "PIS",
+    "CEP",
     "STREET_ADDRESS",
+    "BUILDING_NUMBER",
+    "NEIGHBORHOOD",
     "CITY",
     "STATE",
-    "POSTCODE",
-    "COUNTY",
-    "COUNTRY",
-    
-    # Dates/Times
-    "DATE",
-    "DATE_TIME",
-    "TIME",
-    
-    # Other IDs
-    "ACCOUNT_NUMBER",
-    "CUSTOMER_ID",
-    "EMPLOYEE_ID",
-    "UNIQUE_ID",
-    "BIOMETRIC_IDENTIFIER",
-    "CERTIFICATE_LICENSE_NUMBER",
-    
-    # Age (quasi-identifier but HIPAA relevant for 89+)
-    "AGE",
+    "CREDIT_CARD",
+]
+
+# 6 Sensitive types (optional via INCLUDE_SENSITIVE flag)
+SENSITIVE_ENTITY_TYPES = [
+    "MEDICAL_DATA",
+    "SEXUAL_DATA",
+    "RACE_OR_ETHNICITY",
+    "RELIGIOUS_CONVICTION",
+    "POLITICAL_OPINION",
+    "ORGANIZATION_AFFILIATION",
 ]
 
 # BILOU tagging scheme
 BILOU_TAGS = ["B", "I", "L", "U"]
 
-# Build label mappings
-def build_label_maps():
+# Map dataset labels → internal entity names
+DATASET_TO_ENTITY = {
+    "name": "FIRST_NAME",
+    "middle_name": "MIDDLE_NAME",
+    "surnames": "LAST_NAME",
+    "birthdate": "DATE_OF_BIRTH",
+    "phone": "PHONE_NUMBER",
+    "email": "EMAIL",
+    "cpf": "CPF",
+    "rg": "RG",
+    "pis": "PIS",
+    "cep": "CEP",
+    "street": "STREET_ADDRESS",
+    "building_number": "BUILDING_NUMBER",
+    "neighborhood": "NEIGHBORHOOD",
+    "city_name": "CITY",
+    "state": "STATE",
+    "state_abbr": "STATE",
+    "creditcard": "CREDIT_CARD",
+    # Sensitive
+    "medical_data": "MEDICAL_DATA",
+    "sexual_data": "SEXUAL_DATA",
+    "race_or_ethnicity": "RACE_OR_ETHNICITY",
+    "religious_conviction": "RELIGIOUS_CONVICTION",
+    "political_opinion": "POLITICAL_OPINION",
+    "organization_affiliation": "ORGANIZATION_AFFILIATION",
+}
+
+
+def build_label_maps(include_sensitive=True):
+    """Build BILOU label mappings.
+
+    Args:
+        include_sensitive: If True, include sensitive entity types (22 total).
+                          If False, only structured PII types (16 total).
+
+    Returns:
+        (entity_types, labels, label2id, id2label)
+    """
+    entity_types = list(STRUCTURED_ENTITY_TYPES)
+    if include_sensitive:
+        entity_types.extend(SENSITIVE_ENTITY_TYPES)
+
     labels = ["O"]  # Outside tag first
-    
-    for entity in ENTITY_TYPES:
+    for entity in entity_types:
         for tag in BILOU_TAGS:
             labels.append(f"{tag}-{entity}")
-    
+
     label2id = {label: i for i, label in enumerate(labels)}
     id2label = {i: label for i, label in enumerate(labels)}
-    
-    return labels, label2id, id2label
 
-LABELS, LABEL2ID, ID2LABEL = build_label_maps()
-NUM_LABELS = len(LABELS)  # 101
+    return entity_types, labels, label2id, id2label
 
-# Map Nemotron labels to our standardized labels
-NEMOTRON_TO_ENTITY = {
-    "first_name": "FIRST_NAME",
-    "last_name": "LAST_NAME",
-    "ssn": "SSN",
-    "medical_record_number": "MEDICAL_RECORD_NUMBER",
-    "health_plan_beneficiary_number": "HEALTH_PLAN_BENEFICIARY_NUMBER",
-    "date_of_birth": "DATE_OF_BIRTH",
-    "phone_number": "PHONE_NUMBER",
-    "fax_number": "FAX_NUMBER",
-    "email": "EMAIL",
-    "street_address": "STREET_ADDRESS",
-    "city": "CITY",
-    "state": "STATE",
-    "postcode": "POSTCODE",
-    "county": "COUNTY",
-    "country": "COUNTRY",
-    "date": "DATE",
-    "date_time": "DATE_TIME",
-    "time": "TIME",
-    "account_number": "ACCOUNT_NUMBER",
-    "customer_id": "CUSTOMER_ID",
-    "employee_id": "EMPLOYEE_ID",
-    "unique_id": "UNIQUE_ID",
-    "biometric_identifier": "BIOMETRIC_IDENTIFIER",
-    "certificate_license_number": "CERTIFICATE_LICENSE_NUMBER",
-    "age": "AGE",
+
+# Build default mappings based on INCLUDE_SENSITIVE flag
+ENTITY_TYPES, LABELS, LABEL2ID, ID2LABEL = build_label_maps(INCLUDE_SENSITIVE)
+NUM_LABELS = len(LABELS)  # 89 (full) or 65 (structured only)
+
+# Build dataset-to-entity mapping filtered by active entity types
+ACTIVE_ENTITY_SET = set(ENTITY_TYPES)
+ACTIVE_DATASET_TO_ENTITY = {
+    k: v for k, v in DATASET_TO_ENTITY.items() if v in ACTIVE_ENTITY_SET
 }
 
 if __name__ == "__main__":
-    print(f"Total labels: {NUM_LABELS}")
+    print(f"Include sensitive: {INCLUDE_SENSITIVE}")
     print(f"Entity types: {len(ENTITY_TYPES)}")
+    print(f"Total labels: {NUM_LABELS}")
+    print(f"\nEntity types: {ENTITY_TYPES}")
     print(f"\nFirst 10 labels: {LABELS[:10]}")
     print(f"Last 10 labels: {LABELS[-10:]}")
+    print(f"\nDataset mappings: {len(ACTIVE_DATASET_TO_ENTITY)}")
